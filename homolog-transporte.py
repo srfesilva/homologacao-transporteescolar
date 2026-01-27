@@ -87,7 +87,7 @@ menu = st.sidebar.radio("Ir para:", ["Escola (Solicitação)", "Supervisor (Aval
 # ABA 1: ESCOLA (SOLICITAÇÃO)
 # ---------------------------------------------------------------------
 if menu == "Escola (Solicitação)":
-    st.title("🚌 Solicitação de Transporte Escolar")
+    st.title("🚌 Transporte Escolar - Alunos com Necessidades Especiais")
     st.markdown("---")
 
     if "end_aluno_cache" not in st.session_state: st.session_state.end_aluno_cache = {}
@@ -162,8 +162,8 @@ if menu == "Escola (Solicitação)":
 
         # --- BLOCO 5: DOCUMENTOS ---
         st.subheader("4. Documentação Obrigatória")
-        doc_medico = st.file_uploader("Ficha Médica", type=['pdf', 'jpg', 'png'])
-        doc_viagem = st.file_uploader("Ficha de Programação de Viagem", type=['pdf', 'jpg', 'png'])
+        doc_medico = st.file_uploader("Ficha de Avaliação Médica - Transporte Especial", type=['pdf', 'jpg', 'png'])
+        doc_viagem = st.file_uploader("Ficha de Programação de Viagem - Transporte Especial", type=['pdf', 'jpg', 'png'])
 
         submitted = st.form_submit_button("Enviar Solicitação")
 
@@ -247,9 +247,9 @@ elif menu == "Supervisor (Avaliação)":
                 st.markdown("#### Documentos enviados pela Escola")
                 cd1, cd2 = st.columns(2)
                 if dados[19]:
-                    cd1.download_button("⬇️ Baixar Ficha Médica", data=dados[19], file_name=dados[20] or "medico.pdf")
+                    cd1.download_button("⬇️ Baixar Ficha de Avaliação Médica Transporte Especial", data=dados[19], file_name=dados[20] or "medico.pdf")
                 if dados[21]:
-                    cd2.download_button("⬇️ Baixar Ficha Viagem", data=dados[21], file_name=dados[22] or "viagem.pdf")
+                    cd2.download_button("⬇️ Baixar Ficha de Programação de Viagem Transporte Especial", data=dados[21], file_name=dados[22] or "viagem.pdf")
 
             st.markdown("---")
             st.markdown("### ✍️ Validação e Parecer")
@@ -360,4 +360,5 @@ elif menu == "Relatórios e Docs":
                     st.download_button("✍️ Baixar Parecer Supervisor", data=row[6], file_name=row[7], key=f"ra_{row[0]}")
                 else:
                     st.caption("Ainda não avaliado/assinado")
+
 
