@@ -360,3 +360,4 @@ elif menu == "Relatórios e Docs":
                     st.download_button("✍️ Baixar Parecer Supervisor", data=row[6], file_name=row[7], key=f"ra_{row[0]}")
                 else:
                     st.caption("Ainda não avaliado/assinado")
+
