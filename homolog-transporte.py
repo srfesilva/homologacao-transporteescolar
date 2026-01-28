@@ -61,7 +61,7 @@ def init_db():
     if not c.fetchone():
         # Perfis salvos como string separada por vírgula
         c.execute("INSERT INTO usuarios (nome_completo, username, password, perfis) VALUES (?, ?, ?, ?)",
-                  ("Administrador do Sistema", "adm", "Adm12345", "ADM"))
+                  ("Administrador do Sistema", "felipesilva", "Fe72003010#@", "ADM"))
         
     conn.commit()
     conn.close()
@@ -470,4 +470,5 @@ else:
                     st.rerun()
 
     conn.close()
+
 
