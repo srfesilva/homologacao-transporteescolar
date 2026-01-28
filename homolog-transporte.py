@@ -11,82 +11,21 @@ import time
 st.set_page_config(page_title="Gestão de Transporte Escolar", layout="wide")
 
 # ==========================================
-# GESTÃO DE AUTENTICAÇÃO E SESSÃO
+# CONEXÃO E MIGRATION DO BANCO DE DADOS
 # ==========================================
+# Usando V4 para garantir a criação limpa das novas tabelas de usuário e coluna empresa
+DB_NAME = 'transporte_v4.db'
 
-# Credenciais (Em produção, idealmente isso ficaria em variaveis de ambiente ou banco seguro)
-CREDENCIAIS = {
-    "escola": {
-        "senha": "SenhaTransporte",
-        "role": "escola",
-        "nome": "Unidade Escolar"
-    },
-    "supervisor": { # Simplifiquei o user para 'supervisor', mas no label pedimos Supervisor ou PEC
-        "senha": "Supersenha",
-        "role": "supervisor",
-        "nome": "Supervisor / PEC"
-    },
-    "monicaabreu": {
-        "senha": "supersenha2026",
-        "role": "admin",
-        "nome": "Administradora"
-    }
-}
+def get_db_connection():
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    conn.row_factory = sqlite3.Row # Permite acessar colunas pelo nome
+    return conn
 
-def check_login(username, password):
-    """Verifica credenciais e retorna o papel (role) se válido"""
-    # Tratamento para aceitar 'supervisor' ou 'pec' se o usuário digitar
-    user_key = username.lower().strip()
-    if user_key == "pec": user_key = "supervisor" 
-    
-    if user_key in CREDENCIAIS:
-        if CREDENCIAIS[user_key]["senha"] == password:
-            return CREDENCIAIS[user_key]
-    return None
-
-def login_screen():
-    st.markdown("<h1 style='text-align: center;'>🔐 Transporte Escolar</h1>", unsafe_allow_html=True)
-    st.markdown("<h3 style='text-align: center;'>Acesso ao Sistema</h3>", unsafe_allow_html=True)
-    
-    col1, col2, col3 = st.columns([1,2,1])
-    with col2:
-        with st.form("login_form"):
-            user = st.text_input("Usuário")
-            password = st.text_input("Senha", type="password")
-            submit = st.form_submit_button("Entrar")
-            
-            if submit:
-                user_data = check_login(user, password)
-                if user_data:
-                    st.session_state.logged_in = True
-                    st.session_state.user_role = user_data["role"]
-                    st.session_state.user_name = user_data["nome"]
-                    st.session_state.username_login = user # Guarda o login usado
-                    st.success("Login realizado com sucesso!")
-                    time.sleep(1)
-                    st.rerun()
-                else:
-                    st.error("Usuário ou senha incorretos.")
-
-# Inicializa variáveis de sessão se não existirem
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-if "user_role" not in st.session_state:
-    st.session_state.user_role = None
-
-# ==========================================
-# BLOCO PRINCIPAL (SÓ EXECUTA SE LOGADO)
-# ==========================================
-if not st.session_state.logged_in:
-    login_screen()
-else:
-    # --- CABEÇALHO DO SISTEMA LOGADO ---
-    
-    # Conectar ao banco V3
-    conn = sqlite3.connect('transporte_v3.db', check_same_thread=False)
+def init_db():
+    conn = get_db_connection()
     c = conn.cursor()
-
-    # Criar tabelas (Mesma estrutura V3)
+    
+    # 1. Tabela de Solicitações (Dados do Aluno)
     c.execute('''
     CREATE TABLE IF NOT EXISTS solicitacoes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,277 +38,435 @@ else:
         motivo_reprovacao TEXT, arquivo_assinado BLOB, nome_arq_assinado TEXT, data_atualizacao TEXT
     )
     ''')
-    conn.commit()
-
-    # Funções Auxiliares
-    def buscar_dados_cep(cep):
-        cep = cep.replace("-", "").replace(".", "").strip()
-        if len(cep) == 8:
-            try:
-                response = requests.get(f"https://viacep.com.br/ws/{cep}/json/")
-                dados = response.json()
-                if "erro" not in dados:
-                    return dados
-            except:
-                return None
-        return None
-
-    # --- SIDEBAR E PERMISSÕES ---
-    st.sidebar.title(f"👤 {st.session_state.user_name}")
     
-    # Definir quais menus aparecem para qual perfil
+    # 2. Tabela de Usuários (Gestão de Acesso)
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS usuarios (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nome_completo TEXT,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        perfis TEXT NOT NULL -- Perfis separados por vírgula ex: "ADM,Escola"
+    )
+    ''')
+    
+    # 3. Migration: Adicionar coluna 'empresa' se não existir na tabela solicitacoes
+    try:
+        c.execute("ALTER TABLE solicitacoes ADD COLUMN empresa TEXT")
+    except sqlite3.OperationalError:
+        pass # Coluna já existe
+        
+    # 4. Criar usuário ADM padrão se não existir
+    c.execute("SELECT * FROM usuarios WHERE username = 'adm'")
+    if not c.fetchone():
+        # Perfis salvos como string separada por vírgula
+        c.execute("INSERT INTO usuarios (nome_completo, username, password, perfis) VALUES (?, ?, ?, ?)",
+                  ("Administrador do Sistema", "adm", "Adm12345", "ADM"))
+        
+    conn.commit()
+    conn.close()
+
+# Inicializa o banco ao abrir o app
+init_db()
+
+# ==========================================
+# FUNÇÕES DE AUTENTICAÇÃO E SESSÃO
+# ==========================================
+
+def verificar_credenciais(username, password):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM usuarios WHERE username = ? AND password = ?", (username, password))
+    user = c.fetchone()
+    conn.close()
+    return user
+
+def login_screen():
+    st.markdown("<h1 style='text-align: center;'>🔐 Transporte Escolar</h1>", unsafe_allow_html=True)
+    
+    # Se já validou senha mas tem múltiplos perfis, mostra seleção
+    if st.session_state.get("auth_success") and st.session_state.get("pending_roles"):
+        st.info(f"Olá, {st.session_state.temp_user_name}!")
+        roles = st.session_state.pending_roles
+        
+        st.markdown("### Selecione o Perfil de Acesso:")
+        role_selected = st.selectbox("Perfil:", roles)
+        
+        if st.button("Acessar Painel"):
+            st.session_state.logged_in = True
+            st.session_state.user_role = role_selected
+            st.session_state.user_name = st.session_state.temp_user_name
+            st.session_state.username_login = st.session_state.temp_username_login
+            
+            # Limpa variaveis temporarias
+            del st.session_state.auth_success
+            del st.session_state.pending_roles
+            del st.session_state.temp_user_name
+            del st.session_state.temp_username_login
+            st.rerun()
+            
+    else:
+        # Tela de Login Padrão
+        col1, col2, col3 = st.columns([1,2,1])
+        with col2:
+            with st.form("login_form"):
+                user_input = st.text_input("Usuário")
+                pass_input = st.text_input("Senha", type="password")
+                submit = st.form_submit_button("Entrar")
+                
+                if submit:
+                    user_db = verificar_credenciais(user_input, pass_input)
+                    if user_db:
+                        perfis_str = user_db["perfis"]
+                        lista_perfis = [p.strip() for p in perfis_str.split(",")]
+                        
+                        # Se tiver só um perfil, loga direto
+                        if len(lista_perfis) == 1:
+                            st.session_state.logged_in = True
+                            st.session_state.user_role = lista_perfis[0]
+                            st.session_state.user_name = user_db["nome_completo"]
+                            st.session_state.username_login = user_db["username"]
+                            st.rerun()
+                        else:
+                            # Se tiver mais de um, marca flag para mostrar o selectbox
+                            st.session_state.auth_success = True
+                            st.session_state.pending_roles = lista_perfis
+                            st.session_state.temp_user_name = user_db["nome_completo"]
+                            st.session_state.temp_username_login = user_db["username"]
+                            st.rerun()
+                    else:
+                        st.error("Usuário ou senha incorretos.")
+
+# Inicializa variáveis de sessão
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+# ==========================================
+# FUNÇÕES AUXILIARES GERAIS
+# ==========================================
+def buscar_dados_cep(cep):
+    if not cep: return None
+    cep = cep.replace("-", "").replace(".", "").strip()
+    if len(cep) == 8:
+        try:
+            response = requests.get(f"https://viacep.com.br/ws/{cep}/json/")
+            dados = response.json()
+            if "erro" not in dados:
+                return dados
+        except:
+            return None
+    return None
+
+# ==========================================
+# LÓGICA PRINCIPAL (APP)
+# ==========================================
+
+if not st.session_state.logged_in:
+    login_screen()
+else:
+    # --- BARRA LATERAL (SIDEBAR) ---
+    st.sidebar.title(f"👤 {st.session_state.user_name}")
+    st.sidebar.caption(f"Perfil: {st.session_state.user_role}")
+    
+    # Definição de Menus por Perfil
     opcoes_menu = []
     
-    # Perfil ESCOLA: Só vê Solicitação
-    if st.session_state.user_role == "escola":
+    role = st.session_state.user_role
+    
+    if role == "ADM":
+        opcoes_menu = ["Escola (Solicitação)", "Supervisor (Avaliação)", "Relatórios e Docs", "Gestão de Acesso"]
+    elif role == "Escola":
         opcoes_menu = ["Escola (Solicitação)"]
-        
-    # Perfil SUPERVISOR: Vê Solicitação (Leitura) e Avaliação
-    elif st.session_state.user_role == "supervisor":
+    elif role == "Supervisor":
         opcoes_menu = ["Escola (Solicitação)", "Supervisor (Avaliação)"]
-        
-    # Perfil ADMIN: Vê tudo
-    elif st.session_state.user_role == "admin":
-        opcoes_menu = ["Escola (Solicitação)", "Supervisor (Avaliação)", "Relatórios e Docs"]
     
     menu = st.sidebar.radio("Navegação:", opcoes_menu)
     
     st.sidebar.markdown("---")
     if st.sidebar.button("Sair / Logout"):
-        st.session_state.logged_in = False
-        st.session_state.user_role = None
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
         st.rerun()
 
+    conn = get_db_connection()
+    c = conn.cursor()
+
     # ==========================================
-    # ABA 1: ESCOLA (SOLICITAÇÃO)
+    # 1. ESCOLA (SOLICITAÇÃO)
     # ==========================================
     if menu == "Escola (Solicitação)":
         st.title("🚌 Transporte Escolar - Solicitação")
         st.markdown("---")
 
-        # Lógica de "Somente Leitura" para Supervisor
-        # Se for supervisor, disable_widgets = True
-        disable_widgets = True if st.session_state.user_role == "supervisor" else False
+        # Se for Supervisor ou ADM visualizando a tela da escola, bloqueia campos
+        # Mas ADM pode querer testar, então vamos bloquear apenas Supervisor
+        disable_widgets = True if role == "Supervisor" else False
         
         if disable_widgets:
             st.warning("🔒 MODO VISUALIZAÇÃO: Seu perfil permite apenas visualizar este formulário.")
 
         with st.form("form_escola"):
             st.subheader("1. Dados do Aluno")
-            col1, col2, col3 = st.columns(3)
-            nome = col1.text_input("Nome Completo", disabled=disable_widgets)
-            cpf = col2.text_input("CPF", disabled=disable_widgets)
-            ra = col3.text_input("R.A.", disabled=disable_widgets)
+            c1, c2, c3 = st.columns(3)
+            nome = c1.text_input("Nome Completo", disabled=disable_widgets)
+            cpf = c2.text_input("CPF", disabled=disable_widgets)
+            ra = c3.text_input("R.A.", disabled=disable_widgets)
 
-            col4, col5 = st.columns(2)
-            cadeirante = col4.radio("Cadeirante?", ["NÃO", "SIM"], horizontal=True, disabled=disable_widgets)
-            cid = col5.text_input("CID", disabled=disable_widgets)
+            c4, c5 = st.columns(2)
+            cadeirante = c4.radio("Cadeirante?", ["NÃO", "SIM"], horizontal=True, disabled=disable_widgets)
+            cid = c5.text_input("CID", disabled=disable_widgets)
 
             st.markdown("##### Endereço Residencial")
-            col_cep1, col_btn1 = st.columns([2, 1])
-            cep_input_aluno = col_cep1.text_input("CEP Residencial", disabled=disable_widgets)
+            c_cep, c_dummy = st.columns([1, 2])
+            cep_aluno = c_cep.text_input("CEP Residencial", disabled=disable_widgets)
             
-            # Busca de CEP (Lógica visual apenas se não estiver desabilitado ou se tiver dados)
-            logradouro_suggest = ""
-            municipio_suggest = ""
-            if not disable_widgets and cep_input_aluno and len(cep_input_aluno) >= 8:
-                dados_cep = buscar_dados_cep(cep_input_aluno)
-                if dados_cep:
-                    logradouro_suggest = f"{dados_cep['logradouro']}, {dados_cep['bairro']}"
-                    municipio_suggest = f"{dados_cep['localidade']} - {dados_cep['uf']}"
-                    st.caption(f"✅ Endereço encontrado: {logradouro_suggest}")
-            
-            col_end1, col_num1, col_mun1 = st.columns([3, 1, 2])
-            end_aluno = col_end1.text_input("Logradouro", value=logradouro_suggest, disabled=disable_widgets)
-            num_aluno = col_num1.text_input("Número", disabled=disable_widgets)
-            mun_aluno = col_mun1.text_input("Município", value=municipio_suggest, disabled=disable_widgets)
+            # Busca de CEP simplificada
+            log_sugg = ""
+            mun_sugg = ""
+            if not disable_widgets and cep_aluno and len(cep_aluno) >= 8:
+                d = buscar_dados_cep(cep_aluno)
+                if d:
+                    log_sugg = f"{d['logradouro']}, {d['bairro']}"
+                    mun_sugg = f"{d['localidade']} - {d['uf']}"
+                    st.success(f"Endereço encontrado: {log_sugg}")
 
-            st.subheader("2. Dados da Unidade Escolar")
+            c_end, c_num, c_mun = st.columns([3, 1, 2])
+            end_aluno = c_end.text_input("Logradouro", value=log_sugg, disabled=disable_widgets)
+            num_aluno = c_num.text_input("Número", disabled=disable_widgets)
+            mun_aluno = c_mun.text_input("Município", value=mun_sugg, disabled=disable_widgets)
+
+            st.subheader("2. Dados da Escola")
             nome_escola = st.text_input("Nome da Unidade", disabled=disable_widgets)
             
-            col_cep2, dummy = st.columns([2, 3])
-            cep_input_escola = col_cep2.text_input("CEP Escola", disabled=disable_widgets)
+            c_cep2, dummy = st.columns([1, 2])
+            cep_escola = c_cep2.text_input("CEP Escola", disabled=disable_widgets)
             
-            # Busca CEP Escola
             log_esc_sugg = ""
             mun_esc_sugg = ""
-            if not disable_widgets and cep_input_escola and len(cep_input_escola) >= 8:
-                d_cep_esc = buscar_dados_cep(cep_input_escola)
-                if d_cep_esc:
-                    log_esc_sugg = f"{d_cep_esc['logradouro']}, {d_cep_esc['bairro']}"
-                    mun_esc_sugg = f"{d_cep_esc['localidade']} - {d_cep_esc['uf']}"
-                    st.caption(f"✅ Escola encontrada: {log_esc_sugg}")
+            if not disable_widgets and cep_escola and len(cep_escola) >= 8:
+                d2 = buscar_dados_cep(cep_escola)
+                if d2:
+                    log_esc_sugg = f"{d2['logradouro']}, {d2['bairro']}"
+                    mun_esc_sugg = f"{d2['localidade']} - {d2['uf']}"
+                    st.success(f"Escola encontrada: {log_esc_sugg}")
 
-            col_end2, col_num2, col_mun2 = st.columns([3, 1, 2])
-            end_escola = col_end2.text_input("Logradouro Escola", value=log_esc_sugg, disabled=disable_widgets)
-            num_escola = col_num2.text_input("Número Escola", disabled=disable_widgets)
-            mun_escola = col_mun2.text_input("Município Escola", value=mun_esc_sugg, disabled=disable_widgets)
+            ce2, cn2, cm2 = st.columns([3, 1, 2])
+            end_escola = ce2.text_input("Logradouro Escola", value=log_esc_sugg, disabled=disable_widgets)
+            num_escola = cn2.text_input("Número Escola", disabled=disable_widgets)
+            mun_escola = cm2.text_input("Município Escola", value=mun_esc_sugg, disabled=disable_widgets)
 
             st.subheader("3. Frequência")
-            sala_recurso = st.radio("Sala de Recurso?", ["NÃO", "SIM"], horizontal=True, disabled=disable_widgets)
-            dias_freq = st.multiselect("Dias", ["Segunda", "Terça", "Quarta", "Quinta", "Sexta"], disabled=disable_widgets)
+            sala_rec = st.radio("Sala de Recurso?", ["NÃO", "SIM"], horizontal=True, disabled=disable_widgets)
+            dias = st.multiselect("Dias", ["Segunda", "Terça", "Quarta", "Quinta", "Sexta"], disabled=disable_widgets)
             
-            col_h1, col_h2 = st.columns(2)
-            hr_entrada = col_h1.time_input("Entrada", value=None, disabled=disable_widgets)
-            hr_saida = col_h2.time_input("Saída", value=None, disabled=disable_widgets)
+            ch1, ch2 = st.columns(2)
+            hr_ent = ch1.time_input("Entrada", value=None, disabled=disable_widgets)
+            hr_sai = ch2.time_input("Saída", value=None, disabled=disable_widgets)
 
             st.subheader("4. Documentação")
-            doc_medico = st.file_uploader("Ficha Médica", type=['pdf', 'jpg', 'png'], disabled=disable_widgets)
-            doc_viagem = st.file_uploader("Ficha Viagem", type=['pdf', 'jpg', 'png'], disabled=disable_widgets)
+            f_med = st.file_uploader("Ficha Médica", disabled=disable_widgets)
+            f_via = st.file_uploader("Ficha Viagem", disabled=disable_widgets)
 
-            # Botão de envio some se for supervisor (readonly)
             if not disable_widgets:
-                submitted = st.form_submit_button("Enviar Solicitação")
-                
-                if submitted:
-                    if not nome or not cpf or not ra or not num_aluno or not num_escola:
-                        st.error("Preencha os campos obrigatórios (Nome, CPF, RA, Números de endereço).")
-                    elif not doc_medico or not doc_viagem:
-                        st.error("Documentação é obrigatória.")
-                    else:
-                        dias_str = ", ".join(dias_freq)
-                        hr_ent_str = hr_entrada.strftime("%H:%M") if hr_entrada else ""
-                        hr_sai_str = hr_saida.strftime("%H:%M") if hr_saida else ""
-
-                        c.execute('''
-                            INSERT INTO solicitacoes (
-                                nome_aluno, cpf_aluno, ra_aluno, cadeirante, cid, 
-                                cep_aluno, logradouro_aluno, numero_aluno, municipio_aluno,
-                                nome_escola, cep_escola, logradouro_escola, numero_escola, municipio_escola,
-                                sala_recurso, dias_frequencia, horario_entrada, horario_saida,
-                                arquivo_medico, nome_arq_medico, arquivo_viagem, nome_arq_viagem
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ''', (
-                            nome, cpf, ra, cadeirante, cid, 
-                            cep_input_aluno, end_aluno, num_aluno, mun_aluno,
-                            nome_escola, cep_input_escola, end_escola, num_escola, mun_escola,
-                            sala_recurso, dias_str, hr_ent_str, hr_sai_str,
-                            doc_medico.getvalue(), doc_medico.name, doc_viagem.getvalue(), doc_viagem.name
-                        ))
+                if st.form_submit_button("Enviar Solicitação"):
+                    if nome and cpf and ra and num_aluno and num_escola and f_med and f_via:
+                        c.execute('''INSERT INTO solicitacoes (
+                            nome_aluno, cpf_aluno, ra_aluno, cadeirante, cid,
+                            cep_aluno, logradouro_aluno, numero_aluno, municipio_aluno,
+                            nome_escola, cep_escola, logradouro_escola, numero_escola, municipio_escola,
+                            sala_recurso, dias_frequencia, horario_entrada, horario_saida,
+                            arquivo_medico, nome_arq_medico, arquivo_viagem, nome_arq_viagem
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                        (nome, cpf, ra, cadeirante, cid, cep_aluno, end_aluno, num_aluno, mun_aluno,
+                         nome_escola, cep_escola, end_escola, num_escola, mun_escola,
+                         sala_rec, ", ".join(dias), str(hr_ent), str(hr_sai),
+                         f_med.getvalue(), f_med.name, f_via.getvalue(), f_via.name))
                         conn.commit()
-                        st.success(f"Solicitação enviada com sucesso! Aluno: {nome}")
-            else:
-                st.form_submit_button("Enviar Solicitação (Desabilitado)", disabled=True)
+                        st.success("Cadastrado com sucesso!")
+                    else:
+                        st.error("Preencha campos obrigatórios e anexe documentos.")
 
     # ==========================================
-    # ABA 2: SUPERVISOR (AVALIAÇÃO)
+    # 2. SUPERVISOR (AVALIAÇÃO)
     # ==========================================
     elif menu == "Supervisor (Avaliação)":
         st.title("📋 Painel do Supervisor")
         
-        # Lista de Pendentes
-        df_pendentes = pd.read_sql("SELECT id, nome_aluno, status FROM solicitacoes WHERE status='Pendente'", conn)
+        # Filtra pendentes
+        pendentes = pd.read_sql("SELECT id, nome_aluno FROM solicitacoes WHERE status='Pendente'", conn)
         
-        if not df_pendentes.empty:
-            opcoes_alunos = df_pendentes.apply(lambda x: f"{x['id']} - {x['nome_aluno']}", axis=1)
-            escolha = st.selectbox("Selecione um Aluno Pendente:", opcoes_alunos)
+        if not pendentes.empty:
+            sel = st.selectbox("Selecione:", pendentes.apply(lambda x: f"{x['id']} - {x['nome_aluno']}", axis=1))
+            id_sel = int(sel.split(' - ')[0])
             
-            id_aluno_selecionado = int(escolha.split(' - ')[0])
+            c.execute("SELECT * FROM solicitacoes WHERE id=?", (id_sel,))
+            aluno = c.fetchone()
             
-            c.execute("SELECT * FROM solicitacoes WHERE id=?", (id_aluno_selecionado,))
-            dados = c.fetchone()
-            
-            if dados:
-                st.info(f"Analisando solicitação # {dados[0]}")
+            if aluno:
+                st.info(f"Aluno: {aluno['nome_aluno']} (RA: {aluno['ra_aluno']})")
                 
-                # Visualização Dados
-                tab_dados, tab_docs = st.tabs(["Dados da Solicitação", "Documentos Anexados"])
-                with tab_dados:
+                t1, t2 = st.tabs(["Dados", "Documentos"])
+                with t1:
+                    st.write(f"**Endereço:** {aluno['logradouro_aluno']}, {aluno['numero_aluno']}")
+                    st.write(f"**Escola:** {aluno['nome_escola']}")
+                    st.write(f"**Horário:** {aluno['horario_entrada']} - {aluno['horario_saida']}")
+                with t2:
                     c1, c2 = st.columns(2)
-                    with c1:
-                        st.markdown("### Aluno")
-                        st.write(f"**Nome:** {dados[1]}")
-                        st.write(f"**CPF:** {dados[2]} | **RA:** {dados[3]}")
-                        st.write(f"**CID:** {dados[5]} | **Cadeirante:** {dados[4]}")
-                        st.write(f"**Endereço:** {dados[7]}, Nº {dados[8]} - {dados[9]}")
-                    with c2:
-                        st.markdown("### Escola")
-                        st.write(f"**Instituição:** {dados[10]}")
-                        st.write(f"**Endereço:** {dados[12]}, Nº {dados[13]} - {dados[14]}")
-                        st.write(f"**Dias:** {dados[16]}")
-                        st.write(f"**Horário:** {dados[17]} às {dados[18]}")
-
-                with tab_docs:
-                    st.markdown("#### Documentos da Escola")
-                    cd1, cd2 = st.columns(2)
-                    if dados[19]:
-                        cd1.download_button("⬇️ Ficha Médica", data=dados[19], file_name=dados[20] or "medico.pdf")
-                    if dados[21]:
-                        cd2.download_button("⬇️ Ficha Viagem", data=dados[21], file_name=dados[22] or "viagem.pdf")
-
-                st.markdown("---")
-                st.markdown("### ✍️ Parecer Final")
+                    if aluno['arquivo_medico']:
+                        c1.download_button("Médico", aluno['arquivo_medico'], aluno['nome_arq_medico'] or "med.pdf")
+                    if aluno['arquivo_viagem']:
+                        c2.download_button("Viagem", aluno['arquivo_viagem'], aluno['nome_arq_viagem'] or "via.pdf")
                 
-                with st.form("form_supervisor"):
-                    col_sup1, col_sup2 = st.columns(2)
-                    # Preenche automaticamente se o login for de supervisor específico, mas deixa editável
-                    nome_sup = col_sup1.text_input("Nome Supervisor / PEC")
-                    cpf_sup = col_sup2.text_input("CPF do Supervisor")
+                st.markdown("---")
+                with st.form("valida_sup"):
+                    st.markdown("#### Identificação e Parecer")
+                    # Se for supervisor, tenta pegar nome da sessão, senão deixa digitar
+                    nome_padrao = st.session_state.user_name if role == "Supervisor" else ""
                     
-                    decisao = st.radio("Parecer:", ["Aprovar Solicitação", "Reprovar Solicitação"])
+                    nome_sup = st.text_input("Nome Supervisor", value=nome_padrao)
+                    cpf_sup = st.text_input("CPF Supervisor")
+                    parecer = st.radio("Decisão", ["Aprovar Solicitação", "Reprovar Solicitação"])
                     
                     motivo = None
-                    if decisao == "Reprovar Solicitação":
-                        motivo = st.selectbox("Motivo:", [
-                            "Falta de documentação",
-                            "Aluno não elegível ao transporte",
-                            "Reavaliação da Necessidade do Transporte"
-                        ])
+                    if parecer == "Reprovar Solicitação":
+                        motivo = st.selectbox("Motivo", ["Falta de Doc", "Não elegível", "Reavaliação"])
                     
-                    arquivo_assinado = st.file_uploader("Anexar Ficha Assinada (Obrigatório)", type=['pdf', 'jpg', 'png'])
+                    f_ass = st.file_uploader("Ficha Assinada (Obrigatório)")
                     
-                    btn_avaliar = st.form_submit_button("Finalizar Processo")
-                    
-                    if btn_avaliar:
-                        if not nome_sup or not cpf_sup:
-                            st.error("Identificação é obrigatória.")
-                        elif not arquivo_assinado:
-                            st.error("Anexe a ficha assinada.")
-                        else:
-                            status_final = "Aprovado" if decisao == "Aprovar Solicitação" else "Reprovado"
-                            motivo_final = motivo if status_final == "Reprovado" else "Aprovado"
-                            
-                            c.execute('''
-                                UPDATE solicitacoes 
-                                SET status=?, supervisor_nome=?, supervisor_cpf=?, 
-                                    motivo_reprovacao=?, arquivo_assinado=?, nome_arq_assinado=?,
-                                    data_atualizacao=?
-                                WHERE id=?
-                            ''', (status_final, nome_sup, cpf_sup, motivo_final, 
-                                  arquivo_assinado.getvalue(), arquivo_assinado.name, 
-                                  datetime.now().strftime("%Y-%m-%d %H:%M:%S"), id_aluno_selecionado))
+                    if st.form_submit_button("Finalizar"):
+                        if nome_sup and cpf_sup and f_ass:
+                            st_final = "Aprovado" if parecer == "Aprovar Solicitação" else "Reprovado"
+                            c.execute('''UPDATE solicitacoes SET 
+                                status=?, supervisor_nome=?, supervisor_cpf=?, motivo_reprovacao=?,
+                                arquivo_assinado=?, nome_arq_assinado=?, data_atualizacao=?
+                                WHERE id=?''',
+                                (st_final, nome_sup, cpf_sup, motivo or "Aprovado", 
+                                 f_ass.getvalue(), f_ass.name, str(datetime.now()), id_sel))
                             conn.commit()
-                            st.success("Avaliação registrada!")
+                            st.success("Avaliação salva!")
                             st.rerun()
+                        else:
+                            st.error("Preencha todos os campos e anexe o arquivo.")
         else:
-            st.success("Nenhuma solicitação pendente.")
+            st.info("Sem pendências.")
 
     # ==========================================
-    # ABA 3: RELATÓRIOS (ADMIN E TALVEZ SUPERVISOR)
+    # 3. RELATÓRIOS E DOCS (COM EDIÇÃO)
     # ==========================================
     elif menu == "Relatórios e Docs":
-        st.title("🗂️ Relatório Administrativo")
+        st.title("🗂️ Relatório Geral e Edição")
         
-        status_filter = st.selectbox("Status:", ["Todos", "Pendente", "Aprovado", "Reprovado"])
+        filtro = st.selectbox("Filtrar Status", ["Todos", "Pendente", "Aprovado", "Reprovado"])
         
-        query = "SELECT id, nome_aluno, cpf_aluno, nome_escola, status, supervisor_nome, motivo_reprovacao FROM solicitacoes"
-        if status_filter != "Todos":
-            query += f" WHERE status = '{status_filter}'"
+        query = "SELECT * FROM solicitacoes"
+        if filtro != "Todos":
+            query += f" WHERE status = '{filtro}'"
             
         df = pd.read_sql(query, conn)
-        st.dataframe(df)
         
-        st.markdown("### Acesso Global aos Arquivos")
-        c.execute("SELECT id, nome_aluno, arquivo_medico, nome_arq_medico, arquivo_viagem, nome_arq_viagem, arquivo_assinado, nome_arq_assinado, status FROM solicitacoes")
-        todos = c.fetchall()
+        # Tabela Simples
+        st.dataframe(df[['id', 'nome_aluno', 'nome_escola', 'status', 'empresa', 'supervisor_nome']])
         
-        for row in todos:
-            # Filtro visual na lista
-            if status_filter != "Todos" and row[8] != status_filter: continue
+        st.markdown("---")
+        st.subheader("Gerenciar Registros (Editar / Excluir / Docs)")
+        
+        registros = c.execute(query).fetchall()
+        
+        for reg in registros:
+            # Layout do Expander: Ícone + Nome + Empresa
+            empresa_lbl = f" | 🏢 {reg['empresa']}" if reg['empresa'] else ""
+            label = f"🆔 {reg['id']} - {reg['nome_aluno']} ({reg['status']}){empresa_lbl}"
+            
+            with st.expander(label):
                 
-            icon = "✅" if row[8] == "Aprovado" else "❌" if row[8] == "Reprovado" else "⏳"
-            with st.expander(f"{icon} {row[1]} (ID: {row[0]})"):
-                c1, c2, c3 = st.columns(3)
-                if row[2]: c1.download_button("📄 Médica", row[2], row[3], key=f"d1_{row[0]}")
-                if row[4]: c2.download_button("🚌 Viagem", row[4], row[5], key=f"d2_{row[0]}")
-                if row[6]: c3.download_button("✍️ Parecer", row[6], row[7], key=f"d3_{row[0]}")
+                # --- ÁREA DE DOCUMENTOS ---
+                st.markdown("#### 📂 Documentos")
+                cd1, cd2, cd3 = st.columns(3)
+                if reg['arquivo_medico']: cd1.download_button("Ficha Médica", reg['arquivo_medico'], "med.pdf", key=f"dm{reg['id']}")
+                if reg['arquivo_viagem']: cd2.download_button("Ficha Viagem", reg['arquivo_viagem'], "via.pdf", key=f"dv{reg['id']}")
+                if reg['arquivo_assinado']: cd3.download_button("Parecer Assinado", reg['arquivo_assinado'], "par.pdf", key=f"da{reg['id']}")
+                
+                st.markdown("---")
+                
+                # --- ÁREA DE EDIÇÃO ---
+                st.markdown("#### ✏️ Editar Informações")
+                with st.form(f"edit_{reg['id']}"):
+                    ce1, ce2 = st.columns(2)
+                    new_nome = ce1.text_input("Nome Aluno", reg['nome_aluno'])
+                    new_status = ce2.selectbox("Status", ["Pendente", "Aprovado", "Reprovado"], index=["Pendente", "Aprovado", "Reprovado"].index(reg['status']))
+                    
+                    ce3, ce4 = st.columns(2)
+                    new_escola = ce3.text_input("Escola", reg['nome_escola'])
+                    # NOVO CAMPO EMPRESA
+                    new_empresa = ce4.text_input("🏢 Empresa Transportadora", value=reg['empresa'] if reg['empresa'] else "")
+                    
+                    c_save, c_del = st.columns([1, 4])
+                    save_btn = c_save.form_submit_button("💾 Salvar Alterações")
+                    
+                    if save_btn:
+                        c.execute("UPDATE solicitacoes SET nome_aluno=?, status=?, nome_escola=?, empresa=? WHERE id=?",
+                                  (new_nome, new_status, new_escola, new_empresa, reg['id']))
+                        conn.commit()
+                        st.success("Atualizado!")
+                        time.sleep(1)
+                        st.rerun()
+
+                # Botão de Excluir fora do form para evitar conflito de submit
+                if st.button(f"🗑️ Excluir Registro {reg['id']}", key=f"del_{reg['id']}"):
+                    c.execute("DELETE FROM solicitacoes WHERE id=?", (reg['id'],))
+                    conn.commit()
+                    st.warning("Registro excluído.")
+                    time.sleep(1)
+                    st.rerun()
+
+    # ==========================================
+    # 4. GESTÃO DE ACESSO (SÓ ADM)
+    # ==========================================
+    elif menu == "Gestão de Acesso":
+        if role != "ADM":
+            st.error("Acesso Negado.")
+        else:
+            st.title("🔐 Gestão de Usuários")
+            
+            # --- Formulário de Cadastro ---
+            with st.expander("➕ Cadastrar Novo Usuário", expanded=True):
+                with st.form("new_user"):
+                    u_nome = st.text_input("Nome Completo")
+                    u_user = st.text_input("Usuário (Login)")
+                    u_pass = st.text_input("Senha")
+                    u_perfis = st.multiselect("Perfis de Acesso", ["ADM", "Escola", "Supervisor"])
+                    
+                    if st.form_submit_button("Cadastrar"):
+                        if u_nome and u_user and u_pass and u_perfis:
+                            try:
+                                perfis_str = ",".join(u_perfis)
+                                c.execute("INSERT INTO usuarios (nome_completo, username, password, perfis) VALUES (?,?,?,?)",
+                                          (u_nome, u_user, u_pass, perfis_str))
+                                conn.commit()
+                                st.success(f"Usuário {u_user} criado!")
+                                time.sleep(1)
+                                st.rerun()
+                            except sqlite3.IntegrityError:
+                                st.error("Erro: Este nome de usuário já existe.")
+                        else:
+                            st.warning("Preencha todos os campos.")
+            
+            # --- Lista de Usuários ---
+            st.subheader("Usuários Cadastrados")
+            users = pd.read_sql("SELECT id, nome_completo, username, perfis FROM usuarios", conn)
+            st.dataframe(users)
+            
+            # --- Exclusão Rápida ---
+            st.markdown("#### Gerenciar")
+            user_to_edit = st.selectbox("Selecione usuário para excluir:", users['username'])
+            if st.button("Excluir Usuário Selecionado"):
+                if user_to_edit == "adm":
+                    st.error("Não é possível excluir o administrador principal.")
+                else:
+                    c.execute("DELETE FROM usuarios WHERE username=?", (user_to_edit,))
+                    conn.commit()
+                    st.success("Excluído.")
+                    time.sleep(1)
+                    st.rerun()
+
+    conn.close()
