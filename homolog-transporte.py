@@ -8,7 +8,7 @@ import time
 # ==========================================
 # CONFIGURAÇÃO DA PÁGINA
 # ==========================================
-st.set_page_config(page_title="Gestão de Transporte Escolar", layout="wide")
+st.set_page_config(page_title="HOMOLOG - Gestão de Transporte Escolar", layout="wide")
 
 # ==========================================
 # CONEXÃO E MIGRATION DO BANCO DE DADOS
@@ -470,3 +470,4 @@ else:
                     st.rerun()
 
     conn.close()
+
